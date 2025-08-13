@@ -4,6 +4,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 from time import sleep
+from datetime import datetime
 
 from bs4 import BeautifulSoup
 import html2text
@@ -12,13 +13,9 @@ import requests
 from tqdm import tqdm
 from xml.etree import ElementTree as ET
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.chrome.service import Service
+from camoufox.sync_api import Camoufox
+from browserforge.fingerprints import Screen
 from urllib.parse import urlparse
-from config import EMAIL, PASSWORD
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
 BASE_SUBSTACK_URL: str = "https://www.thefitzwilliam.com/"  # Substack you want to convert to markdown
@@ -80,13 +77,20 @@ class BaseSubstackScraper(ABC):
 
         if not os.path.exists(md_save_dir):
             os.makedirs(md_save_dir)
-            print(f"Created md directory {md_save_dir}")
+            print(f"📁 Created markdown directory: {md_save_dir}")
+        else:
+            print(f"📁 Using existing markdown directory: {md_save_dir}")
+            
         if not os.path.exists(self.html_save_dir):
             os.makedirs(self.html_save_dir)
-            print(f"Created html directory {self.html_save_dir}")
+            print(f"🌐 Created HTML directory: {self.html_save_dir}")
+        else:
+            print(f"🌐 Using existing HTML directory: {self.html_save_dir}")
 
         self.keywords: List[str] = ["about", "archive", "podcast"]
+        print(f"\n🔍 Discovering posts from {self.base_substack_url}...")
         self.post_urls: List[str] = self.get_all_post_urls()
+        print(f"📊 Found {len(self.post_urls)} posts to process")
 
     def get_all_post_urls(self) -> List[str]:
         """
@@ -102,26 +106,28 @@ class BaseSubstackScraper(ABC):
         Fetches URLs from sitemap.xml.
         """
         sitemap_url = f"{self.base_substack_url}sitemap.xml"
+        print(f"   🗺️  Fetching sitemap.xml...")
         response = requests.get(sitemap_url)
 
         if not response.ok:
-            print(f'Error fetching sitemap at {sitemap_url}: {response.status_code}')
+            print(f'   ⚠️  Sitemap not found (status: {response.status_code})')
             return []
 
         root = ET.fromstring(response.content)
         urls = [element.text for element in root.iter('{http://www.sitemaps.org/schemas/sitemap/0.9}loc')]
+        print(f"   ✅ Found {len(urls)} URLs in sitemap")
         return urls
 
     def fetch_urls_from_feed(self) -> List[str]:
         """
         Fetches URLs from feed.xml.
         """
-        print('Falling back to feed.xml. This will only contain up to the 22 most recent posts.')
+        print('   🔄 Falling back to feed.xml (limited to 22 most recent posts)')
         feed_url = f"{self.base_substack_url}feed.xml"
         response = requests.get(feed_url)
 
         if not response.ok:
-            print(f'Error fetching feed at {feed_url}: {response.status_code}')
+            print(f'   ❌ Error fetching feed (status: {response.status_code})')
             return []
 
         root = ET.fromstring(response.content)
@@ -130,7 +136,8 @@ class BaseSubstackScraper(ABC):
             link = item.find('link')
             if link is not None and link.text:
                 urls.append(link.text)
-
+        
+        print(f"   ✅ Found {len(urls)} URLs in feed")
         return urls
 
     @staticmethod
@@ -138,7 +145,11 @@ class BaseSubstackScraper(ABC):
         """
         This method filters out URLs that contain certain keywords
         """
-        return [url for url in urls if all(keyword not in url for keyword in keywords)]
+        filtered = [url for url in urls if all(keyword not in url for keyword in keywords)]
+        removed_count = len(urls) - len(filtered)
+        if removed_count > 0:
+            print(f"   🗑️  Filtered out {removed_count} non-article URLs")
+        return filtered
 
     @staticmethod
     def html_to_md(html_content: str) -> str:
@@ -303,24 +314,42 @@ class BaseSubstackScraper(ABC):
         essays_data = []
         count = 0
         total = num_posts_to_scrape if num_posts_to_scrape != 0 else len(self.post_urls)
-        for url in tqdm(self.post_urls, total=total):
+        
+        print(f"\n📦 Starting to scrape {total} post(s) from {self.base_substack_url}")
+        print(f"📁 Saving to: {self.md_save_dir}\n")
+        
+        for url in tqdm(self.post_urls, total=total, desc="Scraping posts"):
             try:
+                post_name = url.split("/")[-1]
+                print(f"\n🔍 Processing: {post_name}")
+                
                 md_filename = self.get_filename_from_url(url, filetype=".md")
                 html_filename = self.get_filename_from_url(url, filetype=".html")
                 md_filepath = os.path.join(self.md_save_dir, md_filename)
                 html_filepath = os.path.join(self.html_save_dir, html_filename)
 
                 if not os.path.exists(md_filepath):
+                    print(f"   🌐 Fetching content from URL...")
                     soup = self.get_url_soup(url)
                     if soup is None:
+                        print(f"   ⚠️  Failed to fetch content, skipping...")
                         total += 1
                         continue
+                    
+                    print(f"   📤 Extracting post data...")
                     title, subtitle, like_count, date, md = self.extract_post_data(soup)
+                    print(f"   📝 Title: {title[:50]}..." if len(title) > 50 else f"   📝 Title: {title}")
+                    print(f"   📅 Date: {date}")
+                    print(f"   ❤️  Likes: {like_count}")
+                    
+                    print(f"   💾 Saving markdown file...")
                     self.save_to_file(md_filepath, md)
 
                     # Convert markdown to HTML and save
+                    print(f"   🌐 Converting to HTML...")
                     html_content = self.md_to_html(md)
                     self.save_to_html_file(html_filepath, html_content)
+                    print(f"   ✅ Saved: {md_filename}")
 
                     essays_data.append({
                         "title": title,
@@ -331,14 +360,24 @@ class BaseSubstackScraper(ABC):
                         "html_link": html_filepath
                     })
                 else:
-                    print(f"File already exists: {md_filepath}")
+                    print(f"   ⏭️  Skipping (already exists): {md_filename}")
             except Exception as e:
-                print(f"Error scraping post: {e}")
+                print(f"   ❌ Error scraping post: {e}")
             count += 1
             if num_posts_to_scrape != 0 and count == num_posts_to_scrape:
                 break
-        self.save_essays_data_to_json(essays_data=essays_data)
-        generate_html_file(author_name=self.writer_name)
+        
+        # Save metadata and generate index
+        if essays_data:
+            print(f"\n💾 Saving metadata to JSON...")
+            self.save_essays_data_to_json(essays_data=essays_data)
+            print(f"🌐 Generating HTML index page...")
+            generate_html_file(author_name=self.writer_name)
+        
+        print(f"\n✨ Scraping complete!")
+        print(f"   📁 Markdown files saved to: {self.md_save_dir}")
+        print(f"   🌐 HTML files saved to: {self.html_save_dir}")
+        print(f"   📊 Total posts scraped: {len(essays_data)}")
 
 
 class SubstackScraper(BaseSubstackScraper):
@@ -369,73 +408,213 @@ class PremiumSubstackScraper(BaseSubstackScraper):
             headless: bool = False,
             edge_path: str = '',
             edge_driver_path: str = '',
-            user_agent: str = ''
+            user_agent: str = '',
+            cookie_file: Optional[str] = None
     ) -> None:
         super().__init__(base_substack_url, md_save_dir, html_save_dir)
+        self.cookie_file = cookie_file
 
-        options = EdgeOptions()
-        if headless:
-            options.add_argument("--headless")
-        if edge_path:
-            options.binary_location = edge_path
-        if user_agent:
-            options.add_argument(f'user-agent={user_agent}')  # Pass this if running headless and blocked by captcha
+        # Initialize Camoufox browser using context manager approach
+        print(f"\n🔧 Initializing Camoufox browser (headless={headless})...")
+        self.browser = Camoufox(
+            headless=headless,
+            humanize=True,  # Enable human-like behavior
+            screen=Screen(max_width=1920, max_height=1080)  # Set screen resolution constraints
+        ).__enter__()
+        print("✅ Browser initialized successfully")
+        
+        self.page = self.browser.new_page()
+        print("📄 New page created")
+        
+        # Check if cookie file exists and is valid
+        if not self.cookie_file:
+            print("\n❌ Error: No cookie file specified.")
+            print("Please provide a cookie file using the --cookie-file argument.")
+            raise ValueError("Cookie file is required for premium scraping")
+        
+        if not os.path.exists(self.cookie_file):
+            print(f"\n❌ Error: Cookie file not found: {self.cookie_file}")
+            print("Please ensure the cookie file exists and the path is correct.")
+            raise FileNotFoundError(f"Cookie file not found: {self.cookie_file}")
+        
+        print(f"\n🍪 Loading cookies from: {self.cookie_file}")
+        if not self.load_cookies():
+            print("\n❌ Error: Failed to authenticate with cookies.")
+            print("Please ensure your cookies are valid and not expired.")
+            print("To obtain valid cookies:")
+            print("  1. Login to Substack in your browser")
+            print("  2. Export cookies in Netscape format")
+            print("  3. Save to a file and use with --cookie-file")
+            raise ValueError("Cookie authentication failed")
 
-        if edge_driver_path:
-            service = Service(executable_path=edge_driver_path)
-        else:
-            service = Service(EdgeChromiumDriverManager().install())
-
-        self.driver = webdriver.Edge(service=service, options=options)
-        self.login()
-
-    def login(self) -> None:
+    def parse_netscape_cookies(self, cookie_file: str) -> List[dict]:
         """
-        This method logs into Substack using Selenium
+        Parse cookies from standard Netscape format cookie file
+        Format: domain flag path secure expiry name value
         """
-        self.driver.get("https://substack.com/sign-in")
-        sleep(3)
-
-        signin_with_password = self.driver.find_element(
-            By.XPATH, "//a[@class='login-option substack-login__login-option']"
-        )
-        signin_with_password.click()
-        sleep(3)
-
-        # Email and password
-        email = self.driver.find_element(By.NAME, "email")
-        password = self.driver.find_element(By.NAME, "password")
-        email.send_keys(EMAIL)
-        password.send_keys(PASSWORD)
-
-        # Find the submit button and click it.
-        submit = self.driver.find_element(By.XPATH, "//*[@id=\"substack-login\"]/div[2]/div[2]/form/button")
-        submit.click()
-        sleep(30)  # Wait for the page to load
-
-        if self.is_login_failed():
-            raise Exception(
-                "Warning: Login unsuccessful. Please check your email and password, or your account status.\n"
-                "Use the non-premium scraper for the non-paid posts. \n"
-                "If running headless, run non-headlessly to see if blocked by Captcha."
-            )
-
-    def is_login_failed(self) -> bool:
+        cookies = []
+        with open(cookie_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                    
+                parts = line.split('\t')
+                # Standard Netscape format has 7 fields
+                if len(parts) == 7:
+                    domain = parts[0]
+                    # flag = parts[1]  # TRUE/FALSE for domain-wide
+                    path = parts[2]
+                    secure = parts[3].upper() == 'TRUE'
+                    expires = parts[4]
+                    name = parts[5]
+                    value = parts[6]
+                    
+                    # Skip empty cookie names
+                    if not name:
+                        continue
+                    
+                    cookie = {
+                        'name': name,
+                        'value': value,
+                        'domain': domain,
+                        'path': path,
+                        'secure': secure
+                    }
+                    
+                    # Handle expiration (Unix timestamp)
+                    if expires and expires != '0':
+                        try:
+                            cookie['expires'] = int(expires)
+                        except:
+                            pass
+                    
+                    cookies.append(cookie)
+        return cookies
+    
+    def load_cookies(self) -> bool:
         """
-        Check for the presence of the 'error-container' to indicate a failed login attempt.
+        Load cookies from file and check if login is valid
+        Returns True if cookies loaded and login is valid, False otherwise
         """
-        error_container = self.driver.find_elements(By.ID, 'error-container')
-        return len(error_container) > 0 and error_container[0].is_displayed()
+        try:
+            print(f"   📂 Reading cookie file...")
+            
+            # Parse cookies from file
+            cookies = self.parse_netscape_cookies(self.cookie_file)
+            print(f"   🔢 Found {len(cookies)} cookies in file")
+            
+            # Navigate to substack first
+            print("   🌐 Navigating to substack.com...")
+            self.page.goto("https://substack.com")
+            
+            # Add cookies to browser context
+            successful_cookies = 0
+            failed_cookies = 0
+            for cookie in cookies:
+                try:
+                    self.page.context.add_cookies([cookie])
+                    successful_cookies += 1
+                except Exception as e:
+                    failed_cookies += 1
+                    # Only show detailed error in verbose mode
+                    pass
+            
+            print(f"   ✅ Successfully loaded {successful_cookies} cookies")
+            if failed_cookies > 0:
+                print(f"   ⚠️  Failed to load {failed_cookies} cookies (this may be normal)")
+            
+            # Refresh page to apply cookies with shorter timeout
+            print("   🔄 Reloading page to apply cookies...")
+            try:
+                self.page.reload(timeout=5000)
+            except:
+                # Timeout during reload is often okay, cookies may still be loaded
+                pass
+            
+            self.page.wait_for_timeout(2000)
+            
+            # Check if we're logged in by looking for user menu or checking specific element
+            # Try navigating to a page that requires login
+            print("   🔍 Checking if login is valid...")
+            
+            # Navigate to the actual substack publication to verify access
+            try:
+                self.page.goto(self.base_substack_url, timeout=10000)
+                self.page.wait_for_timeout(2000)
+                
+                # Check if we can see subscriber-only content indicators
+                # Look for common logged-in elements
+                current_url = self.page.url
+                
+                # If we're redirected to sign-in, cookies didn't work
+                if "sign-in" in current_url or "login" in current_url:
+                    print("   ❌ Cookies invalid or expired")
+                    return False
+                
+                # Try to check for a user menu or account indicator
+                # This is a more reliable check than URL
+                try:
+                    # Look for common logged-in indicators
+                    user_menu = self.page.locator('[data-testid="user-menu"], .user-menu, [aria-label*="account"]').first
+                    if user_menu.is_visible(timeout=2000):
+                        print("   ✅ Successfully authenticated with cookies!")
+                        return True
+                except:
+                    pass
+                
+                # As a fallback, if we're not on login page, assume success
+                if "sign-in" not in current_url and "login" not in current_url:
+                    print("   ✅ Successfully authenticated with cookies!")
+                    return True
+                    
+            except Exception as e:
+                print(f"   ⚠️  Could not verify login status: {e}")
+                # Assume cookies are valid if we can't verify
+                print("   ✅ Assuming cookies are valid, proceeding...")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"   ❌ Error loading cookies: {e}")
+            return False
+    
 
     def get_url_soup(self, url: str) -> BeautifulSoup:
         """
-        Gets soup from URL using logged in selenium driver
+        Gets soup from URL using logged in Camoufox browser
         """
         try:
-            self.driver.get(url)
-            return BeautifulSoup(self.driver.page_source, "html.parser")
+            # Navigate with a reasonable timeout
+            self.page.goto(url, timeout=30000)
+            
+            # Wait for the main content to be loaded instead of waiting for all network activity
+            # Try multiple selectors that indicate content is loaded
+            try:
+                self.page.wait_for_selector(
+                    "div.available-content, article, .post-content, main", 
+                    timeout=15000
+                )
+            except:
+                # If selectors fail, just wait a bit
+                self.page.wait_for_timeout(5000)
+            
+            # Get the page content
+            content = self.page.content()
+            return BeautifulSoup(content, "html.parser")
         except Exception as e:
             raise ValueError(f"Error fetching page: {e}") from e
+    
+    def __del__(self):
+        """
+        Cleanup method to close browser when object is destroyed
+        """
+        if hasattr(self, 'browser'):
+            try:
+                self.browser.close()
+            except:
+                pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -489,6 +668,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="The directory to save scraped posts as HTML files.",
     )
+    parser.add_argument(
+        "--cookie-file",
+        type=str,
+        default="cookies.txt",
+        help="Path to cookie file in Netscape format for authentication (default: cookies.txt)",
+    )
 
     return parser.parse_args()
 
@@ -508,7 +693,8 @@ def main():
                 args.url,
                 headless=args.headless,
                 md_save_dir=args.directory,
-                html_save_dir=args.html_directory
+                html_save_dir=args.html_directory,
+                cookie_file=args.cookie_file
             )
         else:
             scraper = SubstackScraper(
@@ -525,7 +711,8 @@ def main():
                 md_save_dir=args.directory,
                 html_save_dir=args.html_directory,
                 edge_path=args.edge_path,
-                edge_driver_path=args.edge_driver_path
+                edge_driver_path=args.edge_driver_path,
+                cookie_file=args.cookie_file
             )
         else:
             scraper = SubstackScraper(
