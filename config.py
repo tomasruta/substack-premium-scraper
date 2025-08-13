@@ -1,2 +1,2 @@
-EMAIL = "your-email@domain.com"
-PASSWORD = "your-password"
+# Configuration file for Substack scraper
+# Add any configuration variables here
