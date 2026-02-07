@@ -9,13 +9,19 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 import html2text
 import markdown
+import http.cookiejar
 import requests
 from tqdm import tqdm
 from xml.etree import ElementTree as ET
 
-from camoufox.sync_api import Camoufox
-from browserforge.fingerprints import Screen
 from urllib.parse import urlparse
+
+try:
+    from camoufox.sync_api import Camoufox
+    from browserforge.fingerprints import Screen
+    HAS_CAMOUFOX = True
+except ImportError:
+    HAS_CAMOUFOX = False
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
 BASE_SUBSTACK_URL: str = "https://www.thefitzwilliam.com/"  # Substack you want to convert to markdown
@@ -263,17 +269,39 @@ class BaseSubstackScraper(ABC):
         """
         Converts substack post soup to markdown, returns metadata and content
         """
-        title = soup.select_one("h1.post-title, h2").text.strip()  # When a video is present, the title is demoted to h2
+        # Title: try multiple selectors, null-safe
+        title_el = (
+            soup.select_one("h1.post-title")
+            or soup.select_one("article h1")
+            or soup.select_one("h1")
+            or soup.select_one("h2")
+        )
+        title = title_el.text.strip() if title_el else "Untitled"
 
         subtitle_element = soup.select_one("h3.subtitle")
         subtitle = subtitle_element.text.strip() if subtitle_element else ""
 
-        
-        date_element = soup.find(
-            "div",
-            class_="pencraft pc-reset color-pub-secondary-text-hGQ02T line-height-20-t4M0El font-meta-MWBumP size-11-NuY2Zx weight-medium-fw81nC transform-uppercase-yKDgcq reset-IxiVJZ meta-EgzBVA"
-        )
-        date = date_element.text.strip() if date_element else "Date not found"
+        # Date: try JSON-LD first, then time[datetime], then fallback
+        date = "Date not found"
+        ld_script = soup.select_one('script[type="application/ld+json"]')
+        if ld_script and ld_script.string:
+            try:
+                ld_data = json.loads(ld_script.string)
+                raw_date = ld_data.get("datePublished", "")
+                if raw_date:
+                    dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    date = dt.strftime("%b %d, %Y")
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
+        if date == "Date not found":
+            date_element = soup.select_one("time[datetime]")
+            if date_element:
+                raw_date = date_element.get("datetime", "")
+                try:
+                    dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    date = dt.strftime("%b %d, %Y")
+                except (ValueError, TypeError):
+                    date = date_element.text.strip() if date_element.text else "Date not found"
 
         like_count_element = soup.select_one("a.post-ufi-button .label")
         like_count = (
@@ -282,7 +310,14 @@ class BaseSubstackScraper(ABC):
             else "0"
         )
 
-        content = str(soup.select_one("div.available-content"))
+        # Content: try multiple selectors
+        content_el = (
+            soup.select_one("div.available-content")
+            or soup.select_one(".body.markup")
+            or soup.select_one("article .body")
+            or soup.select_one("article")
+        )
+        content = str(content_el) if content_el else ""
         md = self.html_to_md(content)
         md_content = self.combine_metadata_and_content(title, subtitle, date, like_count, md)
         return title, subtitle, like_count, date, md_content
@@ -393,6 +428,53 @@ class SubstackScraper(BaseSubstackScraper):
             soup = BeautifulSoup(page.content, "html.parser")
             if soup.find("h2", class_="paywall-title"):
                 print(f"Skipping premium article: {url}")
+                return None
+            return soup
+        except Exception as e:
+            raise ValueError(f"Error fetching page: {e}") from e
+
+
+class CookieSubstackScraper(BaseSubstackScraper):
+    """Uses requests with cookie file for authenticated scraping. Much faster than browser-based."""
+    def __init__(
+            self,
+            base_substack_url: str,
+            md_save_dir: str,
+            html_save_dir: str,
+            cookie_file: str,
+    ) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+
+        if not os.path.exists(cookie_file):
+            raise FileNotFoundError(f"Cookie file not found: {cookie_file}")
+
+        cj = http.cookiejar.MozillaCookieJar(cookie_file)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        self.session.cookies = cj
+        print(f"🍪 Loaded {len(cj)} cookies from {cookie_file}")
+
+        super().__init__(base_substack_url, md_save_dir, html_save_dir)
+
+        # Verify authentication by checking one page
+        print("🔍 Verifying cookie authentication...")
+        resp = self.session.get(base_substack_url)
+        if resp.status_code != 200:
+            raise ValueError(f"Failed to access {base_substack_url}: HTTP {resp.status_code}")
+        print("✅ Cookie authentication verified")
+
+    def get_url_soup(self, url: str) -> Optional[BeautifulSoup]:
+        try:
+            resp = self.session.get(url)
+            if resp.status_code != 200:
+                print(f"   ⚠️  HTTP {resp.status_code} for {url}")
+                return None
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Check if we hit a paywall (cookies not working for this article)
+            if soup.find("h2", class_="paywall-title"):
+                print(f"   ⚠️  Paywall detected - cookies may not grant access to this article")
                 return None
             return soup
         except Exception as e:
@@ -689,9 +771,8 @@ def main():
 
     if args.url:
         if args.premium:
-            scraper = PremiumSubstackScraper(
+            scraper = CookieSubstackScraper(
                 args.url,
-                headless=args.headless,
                 md_save_dir=args.directory,
                 html_save_dir=args.html_directory,
                 cookie_file=args.cookie_file
